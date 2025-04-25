@@ -1,0 +1,245 @@
+name: Deploy
+run-name: Deploy ${{ inputs.environment || 'temporary' }}
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: environment
+        description: 'Select the Logical Environment'
+        default: temporary
+        required: true
+      tf_log_level:
+        type: choice
+        description: 'Select the log level for Terraform'
+        default: ERROR
+        options:
+          - DEBUG
+          - INFO
+          - WARN
+          - ERROR
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.environment || 'temporary' }}"
+
+env:
+  JIRA_PREFIX: 'TP'
+  FULL_BRANCH_NAME: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || github.event_name == 'pull_request' && github.head_ref }}
+
+jobs:
+  pre-deploy:
+    name: Pre-deploy
+    uses: ./.github/workflows/pre-deployment-validations.yaml
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  prepare-deployment:
+    name: Prepare Deployment
+    needs: [pre-deploy]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'temporary' }}
+    outputs:
+      logical_env: ${{ steps.prepare-parameters.outputs.logical_env }}
+      image_url: ${{ steps.prepare-parameters.outputs.image_url }}
+    steps:
+      - name: Prepare parameters
+        id: prepare-parameters
+        run: |
+          if [ "${{ inputs.environment || 'temporary' }}" != "temporary" ]; then
+            # Use the logical environment defined in the environment for non-temporary environments.
+            LOGICAL_ENV="${{ vars.LOGICAL_ENV }}"
+            echo "Using provided environment: $LOGICAL_ENV"
+          else
+            # Extract the Jira number from the branch to be used as the logical environment for temporary environments.
+            JIRA_NUMBER=$(echo "${{ env.FULL_BRANCH_NAME }}" | grep -oE '${{ env.JIRA_PREFIX }}"-[0-9]+' || true)
+            if [ -z "$JIRA_NUMBER" ]; then
+              echo "No JIRA number found, generating random environment name..."
+              JIRA_NUMBER="env-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c $((RANDOM % 4 + 3)))"
+            fi
+            LOGICAL_ENV="$JIRA_NUMBER"
+          fi
+
+          IMAGE_URL="ghcr.io/${{ github.repository_owner }}/real test:$LOGICAL_ENV"
+
+          echo "IMAGE_URL=$IMAGE_URL" >> $GITHUB_ENV
+
+          echo "LOGICAL_ENV=$LOGICAL_ENV" >> $GITHUB_ENV
+          echo "# RUN METADATA" >> $GITHUB_STEP_SUMMARY
+          echo "* Logical Environment - $LOGICAL_ENV" >> $GITHUB_STEP_SUMMARY
+          echo "* Image URL - $IMAGE_URL" >> $GITHUB_STEP_SUMMARY
+
+          echo "logical_env=$LOGICAL_ENV" >> $GITHUB_OUTPUT
+          echo "image_url=$IMAGE_URL" >> $GITHUB_OUTPUT
+
+      - name: Check Required Variables
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          BAND: ${{ vars.BAND }}
+          LOGICAL_ENV: ${{ env.LOGICAL_ENV }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          BUCKET: ${{ vars.BUCKET }}
+          DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}
+          SUBNET_IDS: ${{ vars.SUBNET_IDS }}
+          ACM_CERTIFICATE_ARN: ${{ secrets.ACM_CERTIFICATE_ARN }}
+          GHCR_USER: ${{ vars.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          MISSING=false
+
+          check_var() {
+            if [ -z "$1" ]; then
+              echo "❌ Missing required variable: $2" >> $GITHUB_STEP_SUMMARY
+              MISSING=true
+            fi
+          }
+
+          check_var "$AWS_ROLE_ARN" "AWS_ROLE_ARN"
+          check_var "$BAND" "BAND"
+          check_var "$LOGICAL_ENV" "LOGICAL_ENV"
+          check_var "$AWS_REGION" "AWS_REGION"
+          check_var "$BUCKET" "BUCKET"
+          check_var "$DYNAMODB_TABLE" "DYNAMODB_TABLE"
+          check_var "$SUBNET_IDS" "SUBNET_IDS"
+          check_var "$ACM_CERTIFICATE_ARN" "ACM_CERTIFICATE_ARN"
+          check_var "$GHCR_USER" "GHCR_USER"
+          check_var "$GHCR_TOKEN" "GHCR_TOKEN"
+
+          if [ "$MISSING" = true ]; then
+            echo "❌ One or more required variables are missing. Failing pipeline."  >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  build-and-publish-image:
+    name: Build & Publish
+    needs: [prepare-deployment]
+    environment: ${{ inputs.environment || 'temporary' }}
+    runs-on: ubuntu-latest
+    env:
+      LOGICAL_ENV: ${{ needs.prepare-deployment.outputs.logical_env }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        env:
+          LOGICAL_ENV: ${{ env.LOGICAL_ENV  }}
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/real test:${{ env.LOGICAL_ENV }}
+
+
+  deploy:
+    needs: [prepare-deployment, build-and-publish-image]
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'temporary' }} # Defaults to the temporary GitHub environment for PRs
+    env:
+      LOGICAL_ENV: ${{ needs.prepare-deployment.outputs.logical_env }}
+      IMAGE_URL: ${{ needs.prepare-deployment.outputs.image_url }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}"
+          role-session-name: GitHubRunner-${{ vars.BAND }}-${{ env.LOGICAL_ENV }}
+          aws-region: ${{ vars.AWS_REGION }}"
+
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      - name: Capture Terraform Outputs
+        id: tf-outputs
+        run: |
+          cd $GITHUB_WORKSPACE/terraform/workloads
+
+      - name: Generate backend.config file
+        working-directory: ./terraform/env
+        env:
+          BUCKET: ${{ vars.BUCKET }}"
+          LOGICAL_ENV: ${{ env.LOGICAL_ENV }}"
+          AWS_REGION: ${{ vars.AWS_REGION }}"
+          DYNAMODB_TABLE: ${{ vars.DYNAMODB_TABLE }}"
+        run: |
+          envsubst < backend.config.template > backend.config
+
+          echo "Generated backend.config:"
+          cat backend.config
+
+      - name: Generate terraform.tfvars file
+        working-directory: ./terraform/env
+        env:
+          BAND: ${{ vars.BAND }}"
+          LOGICAL_ENV: ${{ env.LOGICAL_ENV }}"
+          VPC_ID: ${{ vars.VPC_ID }}"
+          SUBNET_IDS: ${{ vars.SUBNET_IDS }}"
+          ACM_CERTIFICATE_ARN: ${{ secrets.ACM_CERTIFICATE_ARN }}"
+          GHCR_USER: ${{ vars.GHCR_USER }}"
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}"
+          IMAGE_URL: ${{ env.IMAGE_URL }}"
+        run: |
+          FORMATTED_SUBNET_IDS=$(echo "${{ env.SUBNET_IDS }}" | sed 's/\([^,]*\)/"\1"/g' | sed 's/ //g' | sed 's/^/[/' | sed 's/$/]/')
+
+          echo $FORMATTED_SUBNET_IDS
+          export SUBNET_IDS=$FORMATTED_SUBNET_IDS
+
+          envsubst < terraform.tfvars.template > terraform.tfvars
+
+          echo "Generated terraform.tfvars:"
+          cat terraform.tfvars
+
+      - name: Apply Terraform
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/terraform-outputs
+          export TF_LOG=${{ inputs.tf_log_level || 'ERROR' }}
+          export TF_LOG_PATH=$GITHUB_WORKSPACE/terraform-outputs/terraform.log
+
+          cd $GITHUB_WORKSPACE/terraform/workloads
+          terraform init -backend-config=$GITHUB_WORKSPACE/terraform/env/backend.config
+          terraform validate
+          terraform plan -var-file=$GITHUB_WORKSPACE/terraform/env/terraform.tfvars -out=tfplan
+          terraform apply -auto-approve tfplan
+
+          alb_dns_name=$(terraform output -raw alb_dns_name)
+
+          echo "* ALB DNS - $alb_dns_name" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Terraform Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-logs-${{ inputs.environment || 'temporary' }}
+          path: terraform-outputs/*.log
+
+  post-deploy:
+    needs: [deploy]
+    name: Post-deploy
+    uses: ./.github/workflows/post-deployment-validations.yaml

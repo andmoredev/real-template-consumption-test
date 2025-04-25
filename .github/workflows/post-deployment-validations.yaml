@@ -1,0 +1,13 @@
+name: Post deployment Validations
+
+on:
+  workflow_call:
+
+jobs:
+  post-deploy:
+    name: Post-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test Echo
+        run: |
+          echo "This is the post-deployment GitHub Job"
